@@ -22,14 +22,19 @@ $BashUploadUrl  = "https://bashupload.com"
 $DropboxDestDir = "/script-zip"                      # folder inside your Dropbox
 # --------------------------------------------------------------
 
-# Relaunch in a dedicated window (MAS-style): one clean console, no popups.
-# The fresh window re-fetches and runs the script with the marker set.
+# Try to relaunch in a dedicated window (MAS-style). If the environment blocks
+# spawning a new window (locked-down/corporate), just run in the current window --
+# there are no popups, so a single window works fine either way.
 if (-not $env:SCRIPTZIP_WINDOW) {
-    Start-Process powershell -ArgumentList @(
-        '-NoExit', '-ExecutionPolicy', 'Bypass', '-Command',
-        "`$env:SCRIPTZIP_WINDOW='1'; irm $SelfUrl | iex"
-    )
-    return
+    try {
+        Start-Process powershell -ArgumentList @(
+            '-NoExit', '-ExecutionPolicy', 'Bypass', '-Command',
+            "`$env:SCRIPTZIP_WINDOW='1'; irm $SelfUrl | iex"
+        ) -ErrorAction Stop
+        return
+    } catch {
+        $env:SCRIPTZIP_WINDOW = '1'   # couldn't open a new window -> continue here
+    }
 }
 try { $host.UI.RawUI.WindowTitle = 'script-zip' } catch {}
 
