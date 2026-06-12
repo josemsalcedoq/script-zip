@@ -20,6 +20,7 @@ $Packages       = "/home/developer/projects/life2life"
 $UploadTarget   = "dropbox"                          # "dropbox" | "bashupload"
 $BashUploadUrl  = "https://bashupload.com"
 $DropboxDestDir = "/script-zip"                      # folder inside your Dropbox
+$DropboxMemberId = ""                                # Business/team: dbmid:... (auto-detected if blank)
 # --------------------------------------------------------------
 
 # Try to relaunch in a dedicated window (MAS-style). If the environment blocks
@@ -162,24 +163,36 @@ Write-Host (">> Archive size: " + ($size -join "")) -ForegroundColor Cyan
 if ($UploadTarget -eq 'dropbox') {
     $dest = "$DropboxDestDir/$name"
     Write-Host ">> Uploading to Dropbox via API (chunked, nothing installed)..." -ForegroundColor Cyan
-    # Token passes through the environment (WSLENV), NOT as an arg (not visible in `ps`).
+    # Token + (optional) member id pass through the environment (WSLENV), NOT as args.
     $prevWslEnv = $env:WSLENV
-    $env:DROPBOX_TOKEN = $DropboxToken
-    $env:WSLENV = (@($prevWslEnv, "DROPBOX_TOKEN/u") | Where-Object { $_ }) -join ':'
+    $env:DROPBOX_TOKEN  = $DropboxToken
+    $env:DROPBOX_MEMBER = $DropboxMemberId
+    $env:WSLENV = (@($prevWslEnv, "DROPBOX_TOKEN/u", "DROPBOX_MEMBER/u") | Where-Object { $_ }) -join ':'
     try {
         $result = Invoke-WslScript -Script @'
 set -e
 ARCHIVE="$1"; DEST="$2"
 TOKEN="$DROPBOX_TOKEN"
 [ -n "$TOKEN" ] || { echo "ERROR: no Dropbox token in environment" >&2; exit 1; }
+API="https://api.dropboxapi.com/2"
 C="https://content.dropboxapi.com/2"
+
+# Business/team token? Act as a specific member via Dropbox-API-Select-User.
+SELECT=()
+mid="$DROPBOX_MEMBER"
+if [ -z "$mid" ]; then
+  admin=$(curl -s -X POST "$API/team/token/get_authenticated_admin" -H "Authorization: Bearer $TOKEN" 2>/dev/null)
+  mid=$(printf '%s' "$admin" | grep -o '"team_member_id": *"[^"]*"' | head -1 | sed 's/.*"\(.*\)"$/\1/')
+fi
+if [ -n "$mid" ]; then SELECT=(-H "Dropbox-API-Select-User: $mid"); echo "  (team account -> acting as $mid)" >&2; fi
+
 SIZE=$(stat -c%s "$ARCHIVE")
 CHUNK_MB=140
 tmp=$(mktemp); trap 'rm -f "$tmp"' EXIT
 
 # 1) start an empty upload session
 resp=$(curl -s -X POST "$C/files/upload_session/start" \
-  -H "Authorization: Bearer $TOKEN" \
+  -H "Authorization: Bearer $TOKEN" "${SELECT[@]}" \
   -H 'Dropbox-API-Arg: {"close":false}' \
   -H "Content-Type: application/octet-stream" \
   --data-binary @/dev/null)
@@ -192,7 +205,7 @@ while [ "$offset" -lt "$SIZE" ]; do
   dd if="$ARCHIVE" of="$tmp" bs=1048576 skip=$((i*CHUNK_MB)) count=$CHUNK_MB 2>/dev/null
   n=$(stat -c%s "$tmp"); [ "$n" -gt 0 ] || break
   curl -sf -X POST "$C/files/upload_session/append_v2" \
-    -H "Authorization: Bearer $TOKEN" \
+    -H "Authorization: Bearer $TOKEN" "${SELECT[@]}" \
     -H "Dropbox-API-Arg: {\"cursor\":{\"session_id\":\"$sid\",\"offset\":$offset},\"close\":false}" \
     -H "Content-Type: application/octet-stream" \
     --data-binary @"$tmp" >/dev/null || { echo "append failed at offset $offset" >&2; exit 1; }
@@ -203,14 +216,15 @@ echo >&2
 
 # 3) finish -> commit at DEST, print the stored path
 curl -sf -X POST "$C/files/upload_session/finish" \
-  -H "Authorization: Bearer $TOKEN" \
+  -H "Authorization: Bearer $TOKEN" "${SELECT[@]}" \
   -H "Dropbox-API-Arg: {\"cursor\":{\"session_id\":\"$sid\",\"offset\":$SIZE},\"commit\":{\"path\":\"$DEST\",\"mode\":\"add\",\"autorename\":true,\"mute\":false}}" \
   -H "Content-Type: application/octet-stream" \
   --data-binary @/dev/null | grep -o '"path_display": *"[^"]*"' | sed 's/.*"\(.*\)"$/\1/'
 '@ -WslArgs @($archive, $dest)
         $uploadOk = ($LASTEXITCODE -eq 0)
     } finally {
-        Remove-Item Env:\DROPBOX_TOKEN -ErrorAction SilentlyContinue
+        Remove-Item Env:\DROPBOX_TOKEN  -ErrorAction SilentlyContinue
+        Remove-Item Env:\DROPBOX_MEMBER -ErrorAction SilentlyContinue
         if ($null -ne $prevWslEnv) { $env:WSLENV = $prevWslEnv }
         else { Remove-Item Env:\WSLENV -ErrorAction SilentlyContinue }
     }
