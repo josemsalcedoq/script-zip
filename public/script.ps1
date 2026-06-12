@@ -116,60 +116,33 @@ Write-Host "    2. full - EVERYTHING, includes node_modules"
 do { $m = Read-Host "  Pick 1 or 2" } while ($m -notin '1', '2')
 $mode = if ($m -eq '2') { 'full' } else { 'git' }
 
-# ---------- 4) Compress inside WSL ----------
-if ($mode -eq 'git') {
-    $archive = "/tmp/packages-export.zip"
-    $name    = "packages-export.zip"
-    # Derive the repo from the FIRST selected folder, so it works at any level.
-    $compress = @'
+# ---------- 4) Compress + upload EACH selected folder independently ----------
+# One archive per folder, named exactly after the folder.
+
+# Single-folder compressors ($1=Packages dir  $2=output  $3=folder name)
+$compressGit = @'
 set -e
-PKG="$1"; OUT="$2"; shift 2
-first="$1"
-REPO=$(git -C "$PKG/$first" rev-parse --show-toplevel 2>/dev/null) || {
-  echo "ERROR: '$first' is not inside a git repository. Use 'full' mode for non-git folders." >&2; exit 1; }
-PATHS=()
-for f in "$@"; do
-  d="$PKG/$f"
-  if [ "$d" = "$REPO" ]; then PATHS+=("."); else PATHS+=("${d#$REPO/}"); fi
-done
-git -C "$REPO" archive --format=zip -o "$OUT" HEAD "${PATHS[@]}"
+PKG="$1"; OUT="$2"; F="$3"
+REPO=$(git -C "$PKG/$F" rev-parse --show-toplevel 2>/dev/null) || {
+  echo "ERROR: '$F' is not inside a git repository. Use 'full' mode for non-git folders." >&2; exit 1; }
+d="$PKG/$F"
+if [ "$d" = "$REPO" ]; then REL="."; else REL="${d#$REPO/}"; fi
+git -C "$REPO" archive --format=zip -o "$OUT" HEAD "$REL"
 ls -lh "$OUT" | awk '{print $5}'
 '@
-} else {
-    $archive = "/tmp/packages-export.tar.gz"
-    $name    = "packages-export.tar.gz"
-    $compress = @'
+$compressFull = @'
 set -e
-PKG="$1"; OUT="$2"; shift 2
+PKG="$1"; OUT="$2"; F="$3"
 if command -v pigz >/dev/null 2>&1; then
-  tar -c -C "$PKG" "$@" | pigz > "$OUT"
+  tar -c -C "$PKG" "$F" | pigz > "$OUT"
 else
-  tar -czf "$OUT" -C "$PKG" "$@"
+  tar -czf "$OUT" -C "$PKG" "$F"
 fi
 ls -lh "$OUT" | awk '{print $5}'
 '@
-}
 
-Write-Host ">> Compressing (mode: $mode) inside WSL..." -ForegroundColor Cyan
-$size = Invoke-WslScript -Script $compress -WslArgs (@($Packages, $archive) + $selected)
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "Compression failed. Nothing was uploaded." -ForegroundColor Red
-    if ($mode -eq 'git') { Write-Host "Tip: try 'full' mode (works for any folder, includes node_modules)." -ForegroundColor Yellow }
-    return
-}
-Write-Host (">> Archive size: " + ($size -join "")) -ForegroundColor Cyan
-
-# ---------- 5) Upload ----------
-if ($UploadTarget -eq 'dropbox') {
-    $dest = "$DropboxDestDir/$name"
-    Write-Host ">> Uploading to Dropbox via API (chunked, nothing installed)..." -ForegroundColor Cyan
-    # Token + (optional) member id pass through the environment (WSLENV), NOT as args.
-    $prevWslEnv = $env:WSLENV
-    $env:DROPBOX_TOKEN  = $DropboxToken
-    $env:DROPBOX_MEMBER = $DropboxMemberId
-    $env:WSLENV = (@($prevWslEnv, "DROPBOX_TOKEN/u", "DROPBOX_MEMBER/u") | Where-Object { $_ }) -join ':'
-    try {
-        $result = Invoke-WslScript -Script @'
+# Dropbox upload bash ($1=archive  $2=dest path); token/member via WSLENV.
+$dropboxUpload = @'
 set -e
 ARCHIVE="$1"; DEST="$2"
 TOKEN="$DROPBOX_TOKEN"
@@ -184,13 +157,12 @@ if [ -z "$mid" ]; then
   admin=$(curl -s -X POST "$API/team/token/get_authenticated_admin" -H "Authorization: Bearer $TOKEN" 2>/dev/null)
   mid=$(printf '%s' "$admin" | grep -o '"team_member_id": *"[^"]*"' | head -1 | sed 's/.*"\(.*\)"$/\1/')
 fi
-if [ -n "$mid" ]; then SELECT=(-H "Dropbox-API-Select-User: $mid"); echo "  (team account -> acting as $mid)" >&2; fi
+if [ -n "$mid" ]; then SELECT=(-H "Dropbox-API-Select-User: $mid"); fi
 
 SIZE=$(stat -c%s "$ARCHIVE")
 CHUNK_MB=140
 tmp=$(mktemp); trap 'rm -f "$tmp"' EXIT
 
-# 1) start an empty upload session
 resp=$(curl -s -X POST "$C/files/upload_session/start" \
   -H "Authorization: Bearer $TOKEN" "${SELECT[@]}" \
   -H 'Dropbox-API-Arg: {"close":false}' \
@@ -199,7 +171,6 @@ resp=$(curl -s -X POST "$C/files/upload_session/start" \
 sid=$(printf '%s' "$resp" | grep -o '"session_id": *"[^"]*"' | sed 's/.*"\(.*\)"$/\1/')
 [ -n "$sid" ] || { echo "start failed: $resp" >&2; exit 1; }
 
-# 2) append the file in chunks
 i=0; offset=0
 while [ "$offset" -lt "$SIZE" ]; do
   dd if="$ARCHIVE" of="$tmp" bs=1048576 skip=$((i*CHUNK_MB)) count=$CHUNK_MB 2>/dev/null
@@ -214,40 +185,77 @@ while [ "$offset" -lt "$SIZE" ]; do
 done
 echo >&2
 
-# 3) finish -> commit at DEST, print the stored path
 curl -sf -X POST "$C/files/upload_session/finish" \
   -H "Authorization: Bearer $TOKEN" "${SELECT[@]}" \
   -H "Dropbox-API-Arg: {\"cursor\":{\"session_id\":\"$sid\",\"offset\":$SIZE},\"commit\":{\"path\":\"$DEST\",\"mode\":\"add\",\"autorename\":true,\"mute\":false}}" \
   -H "Content-Type: application/octet-stream" \
   --data-binary @/dev/null | grep -o '"path_display": *"[^"]*"' | sed 's/.*"\(.*\)"$/\1/'
-'@ -WslArgs @($archive, $dest)
-        $uploadOk = ($LASTEXITCODE -eq 0)
-    } finally {
+'@
+
+$ext = if ($mode -eq 'git') { 'zip' } else { 'tar.gz' }
+$compress = if ($mode -eq 'git') { $compressGit } else { $compressFull }
+
+# Set up Dropbox env once for the whole batch.
+$prevWslEnv = $env:WSLENV
+if ($UploadTarget -eq 'dropbox') {
+    $env:DROPBOX_TOKEN  = $DropboxToken
+    $env:DROPBOX_MEMBER = $DropboxMemberId
+    $env:WSLENV = (@($prevWslEnv, "DROPBOX_TOKEN/u", "DROPBOX_MEMBER/u") | Where-Object { $_ }) -join ':'
+}
+
+$summary = @()
+try {
+    foreach ($folder in $selected) {
+        Write-Host ""
+        Write-Host "==== $folder ====" -ForegroundColor Cyan
+        $archive = "/tmp/$folder.$ext"
+        $name    = "$folder.$ext"
+
+        Write-Host ">> Compressing (mode: $mode)..." -ForegroundColor DarkCyan
+        $size = Invoke-WslScript -Script $compress -WslArgs @($Packages, $archive, $folder)
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "  compression failed -> skipped" -ForegroundColor Red
+            if ($mode -eq 'git') { Write-Host "  tip: try 'full' mode for non-git folders." -ForegroundColor Yellow }
+            $summary += [pscustomobject]@{ Folder = $folder; Result = "compress failed"; Ok = $false }
+            continue
+        }
+        Write-Host ("  size: " + ($size -join "")) -ForegroundColor DarkGray
+
+        if ($UploadTarget -eq 'dropbox') {
+            $dest = "$DropboxDestDir/$name"
+            Write-Host ">> Uploading $name to Dropbox..." -ForegroundColor DarkCyan
+            $result = Invoke-WslScript -Script $dropboxUpload -WslArgs @($archive, $dest)
+        } else {
+            Write-Host ">> Uploading $name to $BashUploadUrl..." -ForegroundColor DarkCyan
+            $result = Invoke-WslScript -Script @'
+set -e
+curl -s --upload-file "$1" "$2/$3"
+'@ -WslArgs @($archive, $BashUploadUrl, $name)
+        }
+        $clean = ($result | Where-Object { $_ }) -join ""
+        if ($LASTEXITCODE -eq 0 -and $clean) {
+            Write-Host ("  OK -> " + $clean) -ForegroundColor Green
+            $summary += [pscustomobject]@{ Folder = $folder; Result = $clean; Ok = $true }
+        } else {
+            Write-Host "  upload failed" -ForegroundColor Red
+            $summary += [pscustomobject]@{ Folder = $folder; Result = "upload failed"; Ok = $false }
+        }
+        Invoke-WslScript -Script 'rm -f "$1"' -WslArgs @($archive) | Out-Null
+    }
+} finally {
+    if ($UploadTarget -eq 'dropbox') {
         Remove-Item Env:\DROPBOX_TOKEN  -ErrorAction SilentlyContinue
         Remove-Item Env:\DROPBOX_MEMBER -ErrorAction SilentlyContinue
         if ($null -ne $prevWslEnv) { $env:WSLENV = $prevWslEnv }
         else { Remove-Item Env:\WSLENV -ErrorAction SilentlyContinue }
     }
-    $banner = "UPLOADED TO DROPBOX"
-} else {
-    Write-Host ">> Uploading to $BashUploadUrl (one-time download)..." -ForegroundColor Cyan
-    $result = Invoke-WslScript -Script @'
-set -e
-curl -s --upload-file "$1" "$2/$3"
-'@ -WslArgs @($archive, $BashUploadUrl, $name)
-    $uploadOk = ($LASTEXITCODE -eq 0)
-    $banner = "DOWNLOAD LINK"
 }
 
-$clean = ($result | Where-Object { $_ }) -join ""
-if (-not $uploadOk -or -not $clean) {
-    Write-Host "Upload failed." -ForegroundColor Red
-} else {
-    Write-Host ""
-    Write-Host "============ $banner ============" -ForegroundColor Green
-    Write-Host $clean -ForegroundColor Green
-    Write-Host "=================================" -ForegroundColor Green
+# ---------- Summary ----------
+Write-Host ""
+Write-Host "================ DONE ================" -ForegroundColor Green
+foreach ($s in $summary) {
+    $c = if ($s.Ok) { 'Green' } else { 'Red' }
+    Write-Host ("  {0,-34} {1}" -f $s.Folder, $s.Result) -ForegroundColor $c
 }
-
-# Cleanup temp archive
-Invoke-WslScript -Script 'rm -f "$1"' -WslArgs @($archive) | Out-Null
+Write-Host "=====================================" -ForegroundColor Green
