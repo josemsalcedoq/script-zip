@@ -183,7 +183,8 @@ if you want "what's on origin" instead.
   - [ ] Confirm `curl` installed inside WSL
 - [x] Dropbox: app created (key/secret provided by user)
 - [ ] Dropbox: enable scope files.content.write, generate access token (paste at runtime)
-- [ ] Create GitHub repo + connect to Vercel
+- [x] GitHub repo pushed (josemsalcedoq/script-zip via SSH alias)
+- [x] Deployed to Vercel: https://script-zip.vercel.app (text/plain verified)
 - [ ] (Optional) custom domain
 - [ ] (Optional) refresh-token flow for a permanent (non-4h) Dropbox token
 - [ ] (Optional) encrypt the archive before upload if sensitive

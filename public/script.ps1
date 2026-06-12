@@ -1,52 +1,55 @@
 # ============================================================
-#  script-zip  -  wizard to compress folders from packages/
+#  script-zip  -  pick folders, compress inside WSL, upload
 #  Run on Windows PowerShell with:
-#     irm https://YOUR-PROJECT.vercel.app | iex
+#     irm https://script-zip.vercel.app | iex
 # ============================================================
-#
-#  Flow:
-#   1) Lists the folders inside packages/ (read from WSL)
-#   2) Check the ones to compress       -> OK (Next)
-#   3) Pick a mode                       -> OK (Next)
-#        - git  : only Git-tracked files (NO node_modules, clean)
-#        - full : EVERYTHING, includes node_modules and ignored files
-#   4) Compresses INSIDE WSL (ext4, fast) and uploads -> link
-#
-#  Why inside WSL: the files live in Linux (\\wsl.localhost\polaris).
-#  Reading them through the \\wsl.localhost\ 9P bridge from Windows is
-#  extremely slow with many small files (node_modules). Running tar/git
-#  natively on ext4 avoids the bridge entirely. The upload also runs
-#  from inside WSL, so the 10 GB never crosses into Windows.
+#  Relaunches into its own dedicated window (MAS-style), then:
+#   1) lists folders inside $Packages (read from WSL)
+#   2) in-console checkbox menu to pick folders
+#   3) pick a mode: git (tracked only) or full (everything incl node_modules)
+#   4) compresses INSIDE WSL (ext4, fast) and uploads -> link / Dropbox
+#  All heavy work runs natively in Linux; the bytes never cross to Windows.
 # ============================================================
 
 $ErrorActionPreference = "Stop"
 
 # --- CONFIG ---------------------------------------------------
-$Distro    = "polaris"
-$Packages  = "/home/developer/projects/life2life/health-gbp-main-master/packages"
-
-# Where to upload:
-#   "dropbox"    -> your Dropbox via the Dropbox HTTP API (NOTHING to install in WSL).
-#   "bashupload" -> bashupload.com (50 GB, deleted after first download).
-$UploadTarget = "dropbox"
-
-# bashupload target
-$BashUploadUrl = "https://bashupload.com"
-
-# dropbox target -- direct API via curl, no install needed.
-# The access token is PROMPTED at runtime (never stored: this script is public).
-# Get one at https://www.dropbox.com/developers/apps -> your app -> Settings ->
-# OAuth 2 -> Generated access token (needs scope files.content.write).
-$DropboxDestDir = "/script-zip"   # folder inside your Dropbox to upload into
+$SelfUrl        = "https://script-zip.vercel.app"   # used to relaunch in its own window
+$Distro         = "polaris"
+$Packages       = "/home/developer/projects/life2life"
+$UploadTarget   = "dropbox"                          # "dropbox" | "bashupload"
+$BashUploadUrl  = "https://bashupload.com"
+$DropboxDestDir = "/script-zip"                      # folder inside your Dropbox
 # --------------------------------------------------------------
 
-# Run a bash script (via stdin) inside WSL, passing positional args.
-# Strips CR so bash never chokes on '\r'.
+# Relaunch in a dedicated window (MAS-style): one clean console, no popups.
+# The fresh window re-fetches and runs the script with the marker set.
+if (-not $env:SCRIPTZIP_WINDOW) {
+    Start-Process powershell -ArgumentList @(
+        '-NoExit', '-ExecutionPolicy', 'Bypass', '-Command',
+        "`$env:SCRIPTZIP_WINDOW='1'; irm $SelfUrl | iex"
+    )
+    return
+}
+try { $host.UI.RawUI.WindowTitle = 'script-zip' } catch {}
+
+# Run a bash script inside WSL, passing positional args. The script is base64-encoded
+# (ASCII, survives any pipe/encoding) and decoded in WSL, so Windows PowerShell can't
+# mangle multi-line text piped to wsl.exe.
 function Invoke-WslScript {
     param([string]$Script, [string[]]$WslArgs)
     $clean = $Script -replace "`r", ""
-    $clean | wsl -d $Distro -- bash -s -- @WslArgs
+    $b64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($clean))
+    $quoted = ""
+    if ($WslArgs) {
+        $quoted = ($WslArgs | ForEach-Object { "'" + ($_ -replace "'", "'\''") + "'" }) -join ' '
+    }
+    wsl -d $Distro -- bash -c "echo $b64 | base64 -d | bash -s -- $quoted"
 }
+
+Clear-Host
+Write-Host "  script-zip" -ForegroundColor Cyan
+Write-Host "  $Packages`n" -ForegroundColor DarkGray
 
 # ---------- 0) Sanity check: required tools inside WSL ----------
 $check = Invoke-WslScript -Script @'
@@ -55,11 +58,11 @@ for t in git tar curl; do command -v "$t" >/dev/null 2>&1 || echo "MISSING:$t"; 
 if ($check) {
     Write-Host "Missing tools inside WSL ($Distro):" -ForegroundColor Red
     $check | ForEach-Object { Write-Host "  $_" -ForegroundColor Red }
-    Write-Host "Install them, e.g.:  wsl -d $Distro -- sudo apt update && sudo apt install -y git curl" -ForegroundColor Yellow
+    Write-Host "Install, e.g.:  wsl -d $Distro -- sudo apt update && sudo apt install -y git curl" -ForegroundColor Yellow
     return
 }
 
-# ---------- Ask for the Dropbox token up front (masked input) ----------
+# ---------- Ask for the Dropbox token up front (masked) ----------
 $DropboxToken = $null
 if ($UploadTarget -eq 'dropbox') {
     $sec = Read-Host "Paste your Dropbox access token" -AsSecureString
@@ -67,77 +70,68 @@ if ($UploadTarget -eq 'dropbox') {
     if (-not $DropboxToken) { Write-Host "No token entered. Aborted." -ForegroundColor Red; return }
 }
 
-# ---------- 1) List folders in packages/ ----------
-Write-Host ">> Listing folders in packages/ ..." -ForegroundColor Cyan
-$folders = (Invoke-WslScript -Script @'
+# ---------- 1) List folders ----------
+Write-Host ">> Listing folders in $Packages ..." -ForegroundColor Cyan
+$folders = @((Invoke-WslScript -Script @'
 find "$1" -maxdepth 1 -mindepth 1 -type d -printf '%f\n' | sort
-'@ -WslArgs @($Packages)) | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+'@ -WslArgs @($Packages)) | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+if (-not $folders) { Write-Host "No folders found in $Packages" -ForegroundColor Red; return }
 
-if (-not $folders) {
-    Write-Host "No folders found in $Packages" -ForegroundColor Red
-    return
-}
-
-# ---------- 2) Checkbox selection (OK = Next) ----------
-$hasGrid = [bool](Get-Command Out-GridView -ErrorAction SilentlyContinue)
-$selected = $null
-if ($hasGrid) {
-    $selected = $folders |
-        Out-GridView -Title "Check the folders to compress, then click OK (Next)" -PassThru
-} else {
-    Write-Host "Available folders:" -ForegroundColor Yellow
+# ---------- 2) In-console checkbox menu (no popups) ----------
+$chosen = @{}
+while ($true) {
+    Clear-Host
+    Write-Host "  Select folders to compress  ($Packages)`n" -ForegroundColor Cyan
     for ($i = 0; $i -lt $folders.Count; $i++) {
-        Write-Host ("  [{0}] {1}" -f ($i + 1), $folders[$i])
+        $mark  = if ($chosen[$i]) { "[x]" } else { "[ ]" }
+        $color = if ($chosen[$i]) { "Green" } else { "Gray" }
+        Write-Host ("   {0} {1,2}. {2}" -f $mark, ($i + 1), $folders[$i]) -ForegroundColor $color
     }
-    $ans = Read-Host "Numbers separated by comma (e.g. 1,3,4) or 'all'"
-    if ($ans -eq 'all') {
-        $selected = $folders
-    } else {
-        $selected = $ans -split ',' |
-            ForEach-Object { ($_.Trim() -as [int]) - 1 } |
-            Where-Object { $_ -ge 0 -and $_ -lt $folders.Count } |
-            ForEach-Object { $folders[$_] }
+    Write-Host "`n  numbers toggle (e.g. 1,3)   a = all   n = none   Enter = confirm" -ForegroundColor DarkGray
+    $k = Read-Host "  >"
+    if ($k -eq '') { break }
+    elseif ($k -eq 'a') { for ($i = 0; $i -lt $folders.Count; $i++) { $chosen[$i] = $true } }
+    elseif ($k -eq 'n') { $chosen = @{} }
+    else {
+        foreach ($tok in ($k -split '[,\s]+' | Where-Object { $_ })) {
+            $idx = ($tok -as [int]) - 1
+            if ($idx -ge 0 -and $idx -lt $folders.Count) { $chosen[$idx] = -not $chosen[$idx] }
+        }
     }
 }
+$selected = @(for ($i = 0; $i -lt $folders.Count; $i++) { if ($chosen[$i]) { $folders[$i] } })
 if (-not $selected) { Write-Host "Nothing selected. Aborted." -ForegroundColor Red; return }
 Write-Host (">> Selected: " + ($selected -join ", ")) -ForegroundColor Green
 
-# ---------- 3) Pick a mode (OK = Next) ----------
-$modes = @(
-    [pscustomobject]@{ Mode = "git";  Description = "Git-tracked files only (NO node_modules, clean, from HEAD)" }
-    [pscustomobject]@{ Mode = "full"; Description = "EVERYTHING: includes node_modules and ignored files" }
-)
-$mode = $null
-if ($hasGrid) {
-    $pick = $modes | Out-GridView -Title "Pick a compression mode, then click OK (Next)" -PassThru
-    $mode = $pick.Mode
-} else {
-    Write-Host "1) git  - Git-tracked files only (no node_modules)"
-    Write-Host "2) full - EVERYTHING, includes node_modules"
-    $mode = if ((Read-Host "Pick 1 or 2") -eq '2') { 'full' } else { 'git' }
-}
-if (-not $mode) { Write-Host "No mode picked. Aborted." -ForegroundColor Red; return }
+# ---------- 3) Pick a mode (in-console menu) ----------
+Write-Host "`n  Compression mode:" -ForegroundColor Cyan
+Write-Host "    1. git  - tracked files only (no node_modules, clean)"
+Write-Host "    2. full - EVERYTHING, includes node_modules"
+do { $m = Read-Host "  Pick 1 or 2" } while ($m -notin '1', '2')
+$mode = if ($m -eq '2') { 'full' } else { 'git' }
 
-# ---------- 4) Compress inside WSL + upload ----------
+# ---------- 4) Compress inside WSL ----------
 if ($mode -eq 'git') {
     $archive = "/tmp/packages-export.zip"
     $name    = "packages-export.zip"
-    # $1=Packages dir  $2=output  $3..=selected folder names
-    # git archive only includes tracked files from HEAD -> node_modules excluded.
+    # Derive the repo from the FIRST selected folder, so it works at any level.
     $compress = @'
 set -e
 PKG="$1"; OUT="$2"; shift 2
-REPO=$(git -C "$PKG" rev-parse --show-toplevel)
-PREFIX=${PKG#$REPO/}
+first="$1"
+REPO=$(git -C "$PKG/$first" rev-parse --show-toplevel 2>/dev/null) || {
+  echo "ERROR: '$first' is not inside a git repository. Use 'full' mode for non-git folders." >&2; exit 1; }
 PATHS=()
-for f in "$@"; do PATHS+=("$PREFIX/$f"); done
+for f in "$@"; do
+  d="$PKG/$f"
+  if [ "$d" = "$REPO" ]; then PATHS+=("."); else PATHS+=("${d#$REPO/}"); fi
+done
 git -C "$REPO" archive --format=zip -o "$OUT" HEAD "${PATHS[@]}"
 ls -lh "$OUT" | awk '{print $5}'
 '@
 } else {
     $archive = "/tmp/packages-export.tar.gz"
     $name    = "packages-export.tar.gz"
-    # Uses pigz (multi-core gzip) when available, otherwise plain gzip.
     $compress = @'
 set -e
 PKG="$1"; OUT="$2"; shift 2
@@ -152,13 +146,18 @@ ls -lh "$OUT" | awk '{print $5}'
 
 Write-Host ">> Compressing (mode: $mode) inside WSL..." -ForegroundColor Cyan
 $size = Invoke-WslScript -Script $compress -WslArgs (@($Packages, $archive) + $selected)
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "Compression failed. Nothing was uploaded." -ForegroundColor Red
+    if ($mode -eq 'git') { Write-Host "Tip: try 'full' mode (works for any folder, includes node_modules)." -ForegroundColor Yellow }
+    return
+}
 Write-Host (">> Archive size: " + ($size -join "")) -ForegroundColor Cyan
 
+# ---------- 5) Upload ----------
 if ($UploadTarget -eq 'dropbox') {
     $dest = "$DropboxDestDir/$name"
     Write-Host ">> Uploading to Dropbox via API (chunked, nothing installed)..." -ForegroundColor Cyan
-    # Pass the token through the environment (WSLENV), NOT as an argument, so it
-    # never shows up in the WSL process list. $1=archive  $2=dropbox dest path.
+    # Token passes through the environment (WSLENV), NOT as an arg (not visible in `ps`).
     $prevWslEnv = $env:WSLENV
     $env:DROPBOX_TOKEN = $DropboxToken
     $env:WSLENV = (@($prevWslEnv, "DROPBOX_TOKEN/u") | Where-Object { $_ }) -join ':'
@@ -204,8 +203,8 @@ curl -sf -X POST "$C/files/upload_session/finish" \
   -H "Content-Type: application/octet-stream" \
   --data-binary @/dev/null | grep -o '"path_display": *"[^"]*"' | sed 's/.*"\(.*\)"$/\1/'
 '@ -WslArgs @($archive, $dest)
+        $uploadOk = ($LASTEXITCODE -eq 0)
     } finally {
-        # scrub the token from the Windows environment no matter what
         Remove-Item Env:\DROPBOX_TOKEN -ErrorAction SilentlyContinue
         if ($null -ne $prevWslEnv) { $env:WSLENV = $prevWslEnv }
         else { Remove-Item Env:\WSLENV -ErrorAction SilentlyContinue }
@@ -217,13 +216,19 @@ curl -sf -X POST "$C/files/upload_session/finish" \
 set -e
 curl -s --upload-file "$1" "$2/$3"
 '@ -WslArgs @($archive, $BashUploadUrl, $name)
+    $uploadOk = ($LASTEXITCODE -eq 0)
     $banner = "DOWNLOAD LINK"
 }
 
-Write-Host ""
-Write-Host "============ $banner ============" -ForegroundColor Green
-Write-Host (($result | Where-Object { $_ }) -join "")
-Write-Host "=================================" -ForegroundColor Green
+$clean = ($result | Where-Object { $_ }) -join ""
+if (-not $uploadOk -or -not $clean) {
+    Write-Host "Upload failed." -ForegroundColor Red
+} else {
+    Write-Host ""
+    Write-Host "============ $banner ============" -ForegroundColor Green
+    Write-Host $clean -ForegroundColor Green
+    Write-Host "=================================" -ForegroundColor Green
+}
 
-# Cleanup
+# Cleanup temp archive
 Invoke-WslScript -Script 'rm -f "$1"' -WslArgs @($archive) | Out-Null
