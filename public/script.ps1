@@ -7,7 +7,8 @@
 #   1) lists folders inside $Packages (read from WSL)
 #   2) in-console checkbox menu to pick folders
 #   3) pick a mode: git (tracked only) or full (everything incl node_modules)
-#   4) compresses INSIDE WSL (ext4, fast) and uploads -> link / Dropbox
+#   4) pick a size: complete (one archive) or chunked (fixed-size parts)
+#   5) compresses INSIDE WSL (ext4, fast) and uploads -> link / Dropbox
 #  All heavy work runs natively in Linux; the bytes never cross to Windows.
 # ============================================================
 
@@ -16,7 +17,7 @@ $ErrorActionPreference = "Stop"
 # --- CONFIG ---------------------------------------------------
 $SelfUrl        = "https://script-zip.vercel.app"   # used to relaunch in its own window
 $Distro         = "polaris"
-$Packages       = "/home/developer/projects/life2life"
+$Packages       = "/home/developer/projects/life2lifeJun26"
 $DropboxDestDir = "/script-zip"                      # folder inside your Dropbox
 $DropboxMemberId = ""                                # Business/team: dbmid:... (auto-detected if blank)
 # --------------------------------------------------------------
@@ -122,48 +123,81 @@ Write-Host "    3. node_modules - ONLY the node_modules folders"
 do { $m = Read-Host "  Pick 1, 2 or 3" } while ($m -notin '1', '2', '3')
 $mode = switch ($m) { '2' { 'full' } '3' { 'node_modules' } default { 'git' } }
 
-# ---------- 4) Compress + upload EACH selected folder independently ----------
-# One archive per folder, named exactly after the folder.
+# ---------- 5) Archive size: complete or chunked ----------
+Write-Host "`n  Archive size:" -ForegroundColor Cyan
+Write-Host "    1. Complete - a single archive per folder"
+Write-Host "    2. Chunked  - split into fixed-size parts (easier to move/upload large folders)"
+do { $z = Read-Host "  Pick 1 or 2" } while ($z -notin '1', '2')
+$chunkMb = 0
+if ($z -eq '2') {
+    do {
+        $cs = Read-Host "  Chunk size in MB (Enter = 1900)"
+        if (-not $cs) { $cs = '1900' }
+    } while (-not ($cs -as [int]) -or [int]$cs -le 0)
+    $chunkMb = [int]$cs
+    Write-Host "  Note: chunking makes individual files smaller, but peak /tmp space is still ~ the full archive size." -ForegroundColor DarkGray
+}
 
-# Single-folder compressors ($1=Packages dir  $2=output  $3=folder name)
+# ---------- 5) Compress + upload EACH selected folder independently ----------
+# One archive (or set of chunk parts) per folder, named after the folder.
+#
+# Contract for every compressor ($1=Packages dir  $2=output path  $3=folder  $4=chunkMB):
+#   $4 = 0     -> write a single archive to $2          and echo its basename
+#   $4 > 0     -> stream the archive through `split` into $2.0000, $2.0001, ...
+#                 and echo every part basename, one per line (numeric, sortable)
+# Peak /tmp usage ~= total compressed size either way; chunking only makes the
+# resulting files individually movable, it does NOT lower the temp-disk requirement.
 $compressGit = @'
 set -e
 set -o pipefail
-PKG="$1"; OUT="$2"; F="$3"
+PKG="$1"; OUT="$2"; F="$3"; CHUNK="$4"
 REPO=$(git -C "$PKG/$F" rev-parse --show-toplevel 2>/dev/null) || {
   echo "ERROR: '$F' is not inside a git repository. Use 'full' mode for non-git folders." >&2; exit 1; }
 d="$PKG/$F"
 if [ "$d" = "$REPO" ]; then REL="."; else REL="${d#$REPO/}"; fi
-git -C "$REPO" archive --format=zip -o "$OUT" HEAD "$REL"
-ls -lh "$OUT" | awk '{print $5}'
+rm -f "$OUT" "$OUT".* 2>/dev/null || true
+if [ "$CHUNK" -gt 0 ]; then
+  git -C "$REPO" archive --format=zip HEAD "$REL" | split -b "${CHUNK}M" -d -a 4 - "$OUT."
+  for p in "$OUT".*; do basename "$p"; done
+else
+  git -C "$REPO" archive --format=zip -o "$OUT" HEAD "$REL"
+  basename "$OUT"
+fi
 '@
 $compressFull = @'
 set -e
 set -o pipefail
-PKG="$1"; OUT="$2"; F="$3"
-if command -v pigz >/dev/null 2>&1; then
-  tar -c -C "$PKG" "$F" | pigz > "$OUT"
+PKG="$1"; OUT="$2"; F="$3"; CHUNK="$4"
+rm -f "$OUT" "$OUT".* 2>/dev/null || true
+if command -v pigz >/dev/null 2>&1; then GZ=(pigz); else GZ=(gzip); fi
+if [ "$CHUNK" -gt 0 ]; then
+  tar -c -C "$PKG" "$F" | "${GZ[@]}" | split -b "${CHUNK}M" -d -a 4 - "$OUT."
+  for p in "$OUT".*; do basename "$p"; done
 else
-  tar -czf "$OUT" -C "$PKG" "$F"
+  tar -c -C "$PKG" "$F" | "${GZ[@]}" > "$OUT"
+  basename "$OUT"
 fi
-ls -lh "$OUT" | awk '{print $5}'
 '@
 $compressNode = @'
 set -e
 set -o pipefail
-PKG="$1"; OUT="$2"; F="$3"
+PKG="$1"; OUT="$2"; F="$3"; CHUNK="$4"
 cd "$PKG"
-# every node_modules dir under F (prune so we don't descend into nested ones)
+# every node_modules dir under F (prune so we don't descend into nested ones).
+# This captures the root node_modules AND each packages/*/node_modules.
 DIRS=()
 while IFS= read -r -d '' dir; do DIRS+=("$dir"); done \
   < <(find "$F" -type d -name node_modules -prune -print0)
 [ ${#DIRS[@]} -gt 0 ] || { echo "ERROR: no node_modules found under '$F'." >&2; exit 1; }
-if command -v pigz >/dev/null 2>&1; then
-  tar -c "${DIRS[@]}" | pigz > "$OUT"
+rm -f "$OUT" "$OUT".* 2>/dev/null || true
+if command -v pigz >/dev/null 2>&1; then GZ=(pigz); else GZ=(gzip); fi
+if [ "$CHUNK" -gt 0 ]; then
+  tar -c "${DIRS[@]}" | "${GZ[@]}" | split -b "${CHUNK}M" -d -a 4 - "$OUT."
+  for p in "$OUT".*; do basename "$p"; done
 else
-  tar -czf "$OUT" "${DIRS[@]}"
+  tar -c "${DIRS[@]}" | "${GZ[@]}" > "$OUT"
+  basename "$OUT"
 fi
-ls -lh "$OUT" | awk '{print $5}'
 '@
 
 # Dropbox upload bash ($1=archive  $2=dest path); token/member via WSLENV.
@@ -255,52 +289,68 @@ try {
     foreach ($folder in $selected) {
         Write-Host ""
         Write-Host "==== $folder ====" -ForegroundColor Cyan
-        $archive = "/tmp/$folder.$ext"
-        $name    = "$folder.$ext"
+        $out = "/tmp/$folder.$ext"
 
-        Write-Host ">> Compressing (mode: $mode)..." -ForegroundColor DarkCyan
-        $size = Invoke-WslScript -Script $compress -WslArgs @($Packages, $archive, $folder)
-        if ($LASTEXITCODE -ne 0) {
+        $sizeLabel = if ($chunkMb -gt 0) { "chunked ${chunkMb}MB" } else { "complete" }
+        Write-Host ">> Compressing (mode: $mode, $sizeLabel)..." -ForegroundColor DarkCyan
+        $parts = @(Invoke-WslScript -Script $compress -WslArgs @($Packages, $out, $folder, "$chunkMb") |
+            ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        if ($LASTEXITCODE -ne 0 -or -not $parts) {
             Write-Host "  compression failed -> skipped" -ForegroundColor Red
             if ($mode -eq 'git') { Write-Host "  tip: try 'full' mode for non-git folders." -ForegroundColor Yellow }
             $summary += [pscustomobject]@{ Folder = $folder; Result = "compress failed"; Ok = $false }
             continue
         }
-        Write-Host ("  size: " + ($size -join "")) -ForegroundColor DarkGray
+        Write-Host ("  produced " + $parts.Count + " part(s)") -ForegroundColor DarkGray
 
-        if ($destination -eq 'upload') {
-            $dest = "$DropboxDestDir/$name"
-            Write-Host ">> Uploading $name to Dropbox..." -ForegroundColor DarkCyan
-            $result = Invoke-WslScript -Script $dropboxUpload -WslArgs @($archive, $dest)
-            $clean = ($result | Where-Object { $_ }) -join ""
-            if ($LASTEXITCODE -eq 0 -and $clean) {
-                Write-Host ("  OK -> " + $clean) -ForegroundColor Green
-                $summary += [pscustomobject]@{ Folder = $folder; Result = $clean; Ok = $true }
+        $allOk     = $true
+        $lastDest  = ""
+        foreach ($part in $parts) {
+            $archive = "/tmp/$part"
+            if ($destination -eq 'upload') {
+                Write-Host ">> Uploading $part to Dropbox..." -ForegroundColor DarkCyan
+                $result = Invoke-WslScript -Script $dropboxUpload -WslArgs @($archive, "$DropboxDestDir/$part")
+                $clean = ($result | Where-Object { $_ }) -join ""
+                if ($LASTEXITCODE -eq 0 -and $clean) {
+                    Write-Host ("  OK -> " + $clean) -ForegroundColor Green
+                    $lastDest = $clean
+                } else {
+                    Write-Host "  upload failed: $part" -ForegroundColor Red
+                    $allOk = $false
+                }
             } else {
-                Write-Host "  upload failed" -ForegroundColor Red
-                $summary += [pscustomobject]@{ Folder = $folder; Result = "upload failed"; Ok = $false }
-            }
-        } else {
-            # Local: copy to Windows Downloads from INSIDE WSL (binary-safe cp to /mnt/c
-            # via wslpath); avoids PowerShell mangling binary data over \\wsl.localhost.
-            Write-Host ">> Saving $name to Downloads..." -ForegroundColor DarkCyan
-            $null = Invoke-WslScript -Script @'
+                # Local: copy to Windows Downloads from INSIDE WSL (binary-safe cp to /mnt/c
+                # via wslpath); avoids PowerShell mangling binary data over \\wsl.localhost.
+                Write-Host ">> Saving $part to Downloads..." -ForegroundColor DarkCyan
+                $null = Invoke-WslScript -Script @'
 set -e
 ARCHIVE="$1"; WINDEST="$2"
 DEST=$(wslpath -u "$WINDEST" 2>/dev/null) || { echo "ERROR: cannot map Windows path: $WINDEST" >&2; exit 1; }
 mkdir -p "$DEST"
 cp "$ARCHIVE" "$DEST/"
 '@ -WslArgs @($archive, $winDownloads)
-            if ($LASTEXITCODE -eq 0) {
-                $finalPath = Join-Path $winDownloads $name
-                Write-Host ("  OK -> " + $finalPath) -ForegroundColor Green
-                $summary += [pscustomobject]@{ Folder = $folder; Result = $finalPath; Ok = $true }
-            } else {
-                Write-Host "  save failed" -ForegroundColor Red
-                $summary += [pscustomobject]@{ Folder = $folder; Result = "save failed"; Ok = $false }
+                if ($LASTEXITCODE -eq 0) {
+                    $lastDest = Join-Path $winDownloads $part
+                    Write-Host ("  OK -> " + $lastDest) -ForegroundColor Green
+                } else {
+                    Write-Host "  save failed: $part" -ForegroundColor Red
+                    $allOk = $false
+                }
             }
         }
-        Invoke-WslScript -Script 'rm -f "$1"' -WslArgs @($archive) | Out-Null
+
+        # cleanup the single archive and/or all chunk parts for this folder
+        Invoke-WslScript -Script 'rm -f "$1" "$1".*' -WslArgs @($out) | Out-Null
+
+        if ($chunkMb -gt 0) {
+            $reassemble = if ($ext -eq 'zip') { "cat $folder.zip.* > $folder.zip" }
+                          else { "cat $folder.tar.gz.* | tar xzf -" }
+            Write-Host ("  reassemble (in WSL/Linux): " + $reassemble) -ForegroundColor DarkGray
+            $folderResult = if ($allOk) { "$($parts.Count) parts -> $folder.$ext.*" } else { "partial/failed" }
+        } else {
+            $folderResult = if ($allOk) { $lastDest } else { "failed" }
+        }
+        $summary += [pscustomobject]@{ Folder = $folder; Result = $folderResult; Ok = $allOk }
     }
 } finally {
     if ($destination -eq 'upload') {
