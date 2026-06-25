@@ -1,30 +1,19 @@
-# ============================================================
-#  script-zip  -  pick folders, compress inside WSL, upload
-#  Run on Windows PowerShell with:
-#     irm https://script-zip.vercel.app | iex
-# ============================================================
-#  Relaunches into its own dedicated window (MAS-style), then:
-#   1) lists folders inside $Packages (read from WSL)
-#   2) in-console checkbox menu to pick folders
-#   3) pick a mode: git (tracked only) or full (everything incl node_modules)
-#   4) pick a size: complete (one archive) or chunked (fixed-size parts)
-#   5) compresses INSIDE WSL (ext4, fast) and uploads -> link / Dropbox
-#  All heavy work runs natively in Linux; the bytes never cross to Windows.
-# ============================================================
+# script-zip - run on Windows PowerShell:  irm https://script-zip.vercel.app | iex
+#   1) compress & move folders   2) sync git bundles (meta repos)
+# Heavy work runs in WSL; destination is Windows Downloads or Dropbox.
 
 $ErrorActionPreference = "Stop"
 
 # --- CONFIG ---------------------------------------------------
-$SelfUrl        = "https://script-zip.vercel.app"   # used to relaunch in its own window
-$Distro         = "polaris"
-$Packages       = "/home/developer/projects/life2lifeJun26"
-$DropboxDestDir = "/script-zip"                      # folder inside your Dropbox
+$SelfUrl         = "https://script-zip.vercel.app"   # used to relaunch in its own window
+$Distro          = "polaris"
+$Packages        = "/home/developer/projects/life2lifeJun26"                          # job 1: folders live here
+$MetaRepo        = "/home/developer/projects/life2lifeJun26/health-gbp-main-master"   # job 2: meta repo root
+$DropboxDestDir  = "/script-zip"                     # folder inside your Dropbox
 $DropboxMemberId = ""                                # Business/team: dbmid:... (auto-detected if blank)
 # --------------------------------------------------------------
 
-# Try to relaunch in a dedicated window (MAS-style). If the environment blocks
-# spawning a new window (locked-down/corporate), just run in the current window --
-# there are no popups, so a single window works fine either way.
+# Relaunch in a dedicated window; fall back to the current one if blocked.
 if (-not $env:SCRIPTZIP_WINDOW) {
     try {
         Start-Process powershell -ArgumentList @(
@@ -38,9 +27,7 @@ if (-not $env:SCRIPTZIP_WINDOW) {
 }
 try { $host.UI.RawUI.WindowTitle = 'script-zip' } catch {}
 
-# Run a bash script inside WSL, passing positional args. The script is base64-encoded
-# (ASCII, survives any pipe/encoding) and decoded in WSL, so Windows PowerShell can't
-# mangle multi-line text piped to wsl.exe.
+# Run a bash script inside WSL with positional args (base64 so nothing gets mangled).
 function Invoke-WslScript {
     param([string]$Script, [string[]]$WslArgs)
     $clean = $Script -replace "`r", ""
@@ -54,7 +41,6 @@ function Invoke-WslScript {
 
 Clear-Host
 Write-Host "  script-zip" -ForegroundColor Cyan
-Write-Host "  $Packages`n" -ForegroundColor DarkGray
 
 # ---------- 0) Sanity check: required tools inside WSL ----------
 $check = Invoke-WslScript -Script @'
@@ -67,43 +53,17 @@ if ($check) {
     return
 }
 
-# ---------- 1) List folders ----------
-Write-Host ">> Listing folders in $Packages ..." -ForegroundColor Cyan
-$folders = @((Invoke-WslScript -Script @'
-find "$1" -maxdepth 1 -mindepth 1 -type d -printf '%f\n' | sort
-'@ -WslArgs @($Packages)) | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-if (-not $folders) { Write-Host "No folders found in $Packages" -ForegroundColor Red; return }
+# ---------- 1) Job ----------
+Write-Host "`n  What do you want to do?" -ForegroundColor Cyan
+Write-Host "    1. Compress & move folders"
+Write-Host "    2. Sync git bundles (meta repos) -> laptop"
+do { $j = Read-Host "  Pick 1 or 2" } while ($j -notin '1', '2')
+$job = if ($j -eq '2') { 'sync' } else { 'compress' }
 
-# ---------- 2) In-console checkbox menu (no popups) ----------
-$chosen = @{}
-while ($true) {
-    Clear-Host
-    Write-Host "  Select folders to compress  ($Packages)`n" -ForegroundColor Cyan
-    for ($i = 0; $i -lt $folders.Count; $i++) {
-        $mark  = if ($chosen[$i]) { "[x]" } else { "[ ]" }
-        $color = if ($chosen[$i]) { "Green" } else { "Gray" }
-        Write-Host ("   {0} {1,2}. {2}" -f $mark, ($i + 1), $folders[$i]) -ForegroundColor $color
-    }
-    Write-Host "`n  numbers toggle (e.g. 1,3)   a = all   n = none   Enter = confirm" -ForegroundColor DarkGray
-    $k = Read-Host "  >"
-    if ($k -eq '') { break }
-    elseif ($k -eq 'a') { for ($i = 0; $i -lt $folders.Count; $i++) { $chosen[$i] = $true } }
-    elseif ($k -eq 'n') { $chosen = @{} }
-    else {
-        foreach ($tok in ($k -split '[,\s]+' | Where-Object { $_ })) {
-            $idx = ($tok -as [int]) - 1
-            if ($idx -ge 0 -and $idx -lt $folders.Count) { $chosen[$idx] = -not $chosen[$idx] }
-        }
-    }
-}
-$selected = @(for ($i = 0; $i -lt $folders.Count; $i++) { if ($chosen[$i]) { $folders[$i] } })
-if (-not $selected) { Write-Host "Nothing selected. Aborted." -ForegroundColor Red; return }
-Write-Host (">> Selected: " + ($selected -join ", ")) -ForegroundColor Green
-
-# ---------- 3) Destination: Local or Upload ----------
+# ---------- 2) Destination (shared by both jobs) ----------
 Write-Host "`n  Destination:" -ForegroundColor Cyan
-Write-Host "    1. Local  - compress and save to your Windows Downloads folder"
-Write-Host "    2. Upload - compress and upload to Dropbox"
+Write-Host "    1. Local  - save to your Windows Downloads folder"
+Write-Host "    2. Upload - upload to Dropbox"
 do { $d = Read-Host "  Pick 1 or 2" } while ($d -notin '1', '2')
 $destination = if ($d -eq '2') { 'upload' } else { 'local' }
 
@@ -115,38 +75,14 @@ if ($destination -eq 'upload') {
     if (-not $DropboxToken) { Write-Host "No token entered. Aborted." -ForegroundColor Red; return }
 }
 
-# ---------- 4) Compression mode (3 options, both destinations) ----------
-Write-Host "`n  Compression mode:" -ForegroundColor Cyan
-Write-Host "    1. git          - git-tracked files only (no node_modules, clean)"
-Write-Host "    2. full         - EVERYTHING, includes node_modules"
-Write-Host "    3. node_modules - ONLY the node_modules folders"
-do { $m = Read-Host "  Pick 1, 2 or 3" } while ($m -notin '1', '2', '3')
-$mode = switch ($m) { '2' { 'full' } '3' { 'node_modules' } default { 'git' } }
+# Windows Downloads: local target, and where l2l-have.txt is read for incremental sync.
+try {
+    $reg = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders' -Name '{374DE290-123F-4565-9164-39C4925E467B}' -ErrorAction Stop
+    $winDownloads = [Environment]::ExpandEnvironmentVariables($reg.'{374DE290-123F-4565-9164-39C4925E467B}')
+} catch { $winDownloads = Join-Path $env:USERPROFILE 'Downloads' }
+if (-not (Test-Path -LiteralPath $winDownloads)) { New-Item -ItemType Directory -Path $winDownloads -Force | Out-Null }
 
-# ---------- 5) Archive size: complete or chunked ----------
-Write-Host "`n  Archive size:" -ForegroundColor Cyan
-Write-Host "    1. Complete - a single archive per folder"
-Write-Host "    2. Chunked  - split into fixed-size parts (easier to move/upload large folders)"
-do { $z = Read-Host "  Pick 1 or 2" } while ($z -notin '1', '2')
-$chunkMb = 0
-if ($z -eq '2') {
-    do {
-        $cs = Read-Host "  Chunk size in MB (Enter = 1900)"
-        if (-not $cs) { $cs = '1900' }
-    } while (-not ($cs -as [int]) -or [int]$cs -le 0)
-    $chunkMb = [int]$cs
-    Write-Host "  Note: chunking makes individual files smaller, but peak /tmp space is still ~ the full archive size." -ForegroundColor DarkGray
-}
-
-# ---------- 5) Compress + upload EACH selected folder independently ----------
-# One archive (or set of chunk parts) per folder, named after the folder.
-#
-# Contract for every compressor ($1=Packages dir  $2=output path  $3=folder  $4=chunkMB):
-#   $4 = 0     -> write a single archive to $2          and echo its basename
-#   $4 > 0     -> stream the archive through `split` into $2.0000, $2.0001, ...
-#                 and echo every part basename, one per line (numeric, sortable)
-# Peak /tmp usage ~= total compressed size either way; chunking only makes the
-# resulting files individually movable, it does NOT lower the temp-disk requirement.
+# Bash blocks. Compressor: $1=pkgDir $2=out $3=folder $4=chunkMB; echoes part basenames.
 $compressGit = @'
 set -e
 set -o pipefail
@@ -183,8 +119,6 @@ set -e
 set -o pipefail
 PKG="$1"; OUT="$2"; F="$3"; CHUNK="$4"
 cd "$PKG"
-# every node_modules dir under F (prune so we don't descend into nested ones).
-# This captures the root node_modules AND each packages/*/node_modules.
 DIRS=()
 while IFS= read -r -d '' dir; do DIRS+=("$dir"); done \
   < <(find "$F" -type d -name node_modules -prune -print0)
@@ -200,7 +134,29 @@ else
 fi
 '@
 
-# Dropbox upload bash ($1=archive  $2=dest path); token/member via WSLENV.
+# Bundle one repo: $1=metaRepo $2=out $3=rel $4=baseSha $5=full.
+# Echoes basename on success; exit 0 + no output = no changes.
+$bundleGen = @'
+set -e
+set -o pipefail
+META="$1"; OUT="$2"; REL="$3"; BASE="$4"; FULL="$5"
+cd "$META/$REL"
+git fetch --all --prune --quiet 2>/dev/null || git fetch --prune --quiet
+up=$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)
+[ -n "$up" ] || up=$(git rev-parse --abbrev-ref origin/HEAD 2>/dev/null || true)
+if [ -z "$up" ]; then echo "ERROR: no remote branch for $REL" >&2; exit 1; fi
+tip=$(git rev-parse --verify --quiet "$up^{commit}") || { echo "ERROR: cannot resolve $up" >&2; exit 1; }
+rm -f "$OUT" 2>/dev/null || true
+if [ -z "$FULL" ] && [ -n "$BASE" ] && git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
+  if [ "$BASE" = "$tip" ]; then exit 0; fi          # nothing new -> no part
+  git bundle create "$OUT" "^$BASE" "$up" >/dev/null
+else
+  git bundle create "$OUT" --all >/dev/null
+fi
+basename "$OUT"
+'@
+
+# Dropbox upload ($1=archive  $2=dest path); token/member via WSLENV.
 $dropboxUpload = @'
 set -e
 ARCHIVE="$1"; DEST="$2"
@@ -209,7 +165,6 @@ TOKEN="$DROPBOX_TOKEN"
 API="https://api.dropboxapi.com/2"
 C="https://content.dropboxapi.com/2"
 
-# Business/team token? Act as a specific member via Dropbox-API-Select-User.
 SELECT=()
 mid="$DROPBOX_MEMBER"
 if [ -z "$mid" ]; then
@@ -262,21 +217,101 @@ curl -sf -X POST "$C/files/upload_session/finish" \
   --data-binary @/dev/null | grep -o '"path_display": *"[^"]*"' | sed 's/.*"\(.*\)"$/\1/'
 '@
 
-$ext = if ($mode -eq 'git') { 'zip' } else { 'tar.gz' }
-$compress = switch ($mode) { 'full' { $compressFull } 'node_modules' { $compressNode } default { $compressGit } }
+# Local copy: $1=archive $2=Windows dest dir (binary-safe via wslpath).
+$localCopy = @'
+set -e
+ARCHIVE="$1"; WINDEST="$2"
+DEST=$(wslpath -u "$WINDEST" 2>/dev/null) || { echo "ERROR: cannot map Windows path: $WINDEST" >&2; exit 1; }
+mkdir -p "$DEST"
+cp "$ARCHIVE" "$DEST/"
+'@
 
-# Local destination: resolve the real Windows Downloads folder (handles redirection).
-$winDownloads = $null
-if ($destination -eq 'local') {
-    try {
-        $reg = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders' -Name '{374DE290-123F-4565-9164-39C4925E467B}' -ErrorAction Stop
-        $winDownloads = [Environment]::ExpandEnvironmentVariables($reg.'{374DE290-123F-4565-9164-39C4925E467B}')
-    } catch { $winDownloads = Join-Path $env:USERPROFILE 'Downloads' }
-    if (-not (Test-Path -LiteralPath $winDownloads)) { New-Item -ItemType Directory -Path $winDownloads -Force | Out-Null }
-    Write-Host ">> Local target: $winDownloads" -ForegroundColor DarkGray
+$workItems = @()
+if ($job -eq 'compress') {
+    Write-Host "`n>> Listing folders in $Packages ..." -ForegroundColor Cyan
+    $folders = @((Invoke-WslScript -Script @'
+find "$1" -maxdepth 1 -mindepth 1 -type d -printf '%f\n' | sort
+'@ -WslArgs @($Packages)) | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    if (-not $folders) { Write-Host "No folders found in $Packages" -ForegroundColor Red; return }
+
+    $chosen = @{}
+    while ($true) {
+        Clear-Host
+        Write-Host "  Select folders to compress  ($Packages)`n" -ForegroundColor Cyan
+        for ($i = 0; $i -lt $folders.Count; $i++) {
+            $mark  = if ($chosen[$i]) { "[x]" } else { "[ ]" }
+            $color = if ($chosen[$i]) { "Green" } else { "Gray" }
+            Write-Host ("   {0} {1,2}. {2}" -f $mark, ($i + 1), $folders[$i]) -ForegroundColor $color
+        }
+        Write-Host "`n  numbers toggle (e.g. 1,3)   a = all   n = none   Enter = confirm" -ForegroundColor DarkGray
+        $k = Read-Host "  >"
+        if ($k -eq '') { break }
+        elseif ($k -eq 'a') { for ($i = 0; $i -lt $folders.Count; $i++) { $chosen[$i] = $true } }
+        elseif ($k -eq 'n') { $chosen = @{} }
+        else {
+            foreach ($tok in ($k -split '[,\s]+' | Where-Object { $_ })) {
+                $idx = ($tok -as [int]) - 1
+                if ($idx -ge 0 -and $idx -lt $folders.Count) { $chosen[$idx] = -not $chosen[$idx] }
+            }
+        }
+    }
+    $selected = @(for ($i = 0; $i -lt $folders.Count; $i++) { if ($chosen[$i]) { $folders[$i] } })
+    if (-not $selected) { Write-Host "Nothing selected. Aborted." -ForegroundColor Red; return }
+    Write-Host (">> Selected: " + ($selected -join ", ")) -ForegroundColor Green
+
+    Write-Host "`n  Compression mode:" -ForegroundColor Cyan
+    Write-Host "    1. git          - git-tracked files only (no node_modules, clean)"
+    Write-Host "    2. full         - EVERYTHING, includes node_modules"
+    Write-Host "    3. node_modules - ONLY the node_modules folders"
+    do { $m = Read-Host "  Pick 1, 2 or 3" } while ($m -notin '1', '2', '3')
+    $mode = switch ($m) { '2' { 'full' } '3' { 'node_modules' } default { 'git' } }
+
+    Write-Host "`n  Archive size:" -ForegroundColor Cyan
+    Write-Host "    1. Complete - a single archive per folder"
+    Write-Host "    2. Chunked  - split into fixed-size parts"
+    do { $z = Read-Host "  Pick 1 or 2" } while ($z -notin '1', '2')
+    $chunkMb = 0
+    if ($z -eq '2') {
+        do {
+            $cs = Read-Host "  Chunk size in MB (Enter = 1900)"
+            if (-not $cs) { $cs = '1900' }
+        } while (-not ($cs -as [int]) -or [int]$cs -le 0)
+        $chunkMb = [int]$cs
+        Write-Host "  Note: chunking only makes files individually movable; peak /tmp use is still ~ full archive size." -ForegroundColor DarkGray
+    }
+
+    $ext      = if ($mode -eq 'git') { 'zip' } else { 'tar.gz' }
+    $compress = switch ($mode) { 'full' { $compressFull } 'node_modules' { $compressNode } default { $compressGit } }
+    $workItems = $selected
+}
+else {
+    Write-Host "`n>> Discovering repos under $MetaRepo ..." -ForegroundColor Cyan
+    $repoRels = @((Invoke-WslScript -Script @'
+cd "$1" 2>/dev/null || exit 1
+[ -d ".git" ] && echo .
+for d in packages/*/; do [ -d "${d}.git" ] && echo "${d%/}"; done
+'@ -WslArgs @($MetaRepo)) | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    if (-not $repoRels) { Write-Host "No git repos under $MetaRepo" -ForegroundColor Red; return }
+    Write-Host (">> Found " + $repoRels.Count + " repos") -ForegroundColor Green
+
+    $haveMap = @{}
+    $haveFile = Join-Path $winDownloads 'l2l-have.txt'
+    if (Test-Path -LiteralPath $haveFile) {
+        Get-Content -LiteralPath $haveFile | ForEach-Object {
+            $p = (($_ -replace '\s+', ' ').Trim()) -split ' '
+            if ($p.Count -ge 2 -and $p[0]) { $haveMap[$p[0]] = $p[1] }
+        }
+        Write-Host (">> Incremental (l2l-have.txt: " + $haveMap.Count + " repos known)") -ForegroundColor DarkCyan
+    } else {
+        Write-Host ">> Full bundles (no l2l-have.txt in Downloads)" -ForegroundColor Yellow
+    }
+    $workItems = $repoRels
 }
 
-# Upload destination: set up Dropbox env once for the whole batch.
+$localTarget = if ($job -eq 'sync') { Join-Path $winDownloads 'l2l-bundles' } else { $winDownloads }
+$dropDir     = if ($job -eq 'sync') { "$DropboxDestDir/l2l-bundles" } else { $DropboxDestDir }
+if ($destination -eq 'local') { Write-Host ">> Local target: $localTarget" -ForegroundColor DarkGray }
+
 $prevWslEnv = $env:WSLENV
 if ($destination -eq 'upload') {
     $env:DROPBOX_TOKEN  = $DropboxToken
@@ -286,30 +321,58 @@ if ($destination -eq 'upload') {
 
 $summary = @()
 try {
-    foreach ($folder in $selected) {
-        Write-Host ""
-        Write-Host "==== $folder ====" -ForegroundColor Cyan
-        $out = "/tmp/$folder.$ext"
+    foreach ($item in $workItems) {
+        if ($job -eq 'compress') {
+            $name      = $item
+            $out       = "/tmp/$name.$ext"
+            $sizeLabel = if ($chunkMb -gt 0) { "chunked ${chunkMb}MB" } else { "complete" }
+            $label     = "compress (mode: $mode, $sizeLabel)"
+        } else {
+            $rel   = $item
+            $name  = if ($rel -eq '.') { '_root' } else { ($rel -split '/')[-1] }
+            $out   = "/tmp/$name.bundle"
+            $base  = if ($haveMap.ContainsKey($name)) { $haveMap[$name] } else { "" }
+            $label = if ($base) { "bundle (incremental)" } else { "bundle (full)" }
+        }
 
-        $sizeLabel = if ($chunkMb -gt 0) { "chunked ${chunkMb}MB" } else { "complete" }
-        Write-Host ">> Compressing (mode: $mode, $sizeLabel)..." -ForegroundColor DarkCyan
-        $parts = @(Invoke-WslScript -Script $compress -WslArgs @($Packages, $out, $folder, "$chunkMb") |
-            ForEach-Object { $_.Trim() } | Where-Object { $_ })
-        if ($LASTEXITCODE -ne 0 -or -not $parts) {
-            Write-Host "  compression failed -> skipped" -ForegroundColor Red
-            if ($mode -eq 'git') { Write-Host "  tip: try 'full' mode for non-git folders." -ForegroundColor Yellow }
-            $summary += [pscustomobject]@{ Folder = $folder; Result = "compress failed"; Ok = $false }
+        Write-Host ""
+        Write-Host "==== $name ====" -ForegroundColor Cyan
+        Write-Host ">> Building $label ..." -ForegroundColor DarkCyan
+
+        if ($job -eq 'compress') {
+            $parts = @(Invoke-WslScript -Script $compress -WslArgs @($Packages, $out, $name, "$chunkMb") |
+                ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        } else {
+            $parts = @(Invoke-WslScript -Script $bundleGen -WslArgs @($MetaRepo, $out, $rel, $base, "") |
+                ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        }
+        $code = $LASTEXITCODE
+
+        if ($code -ne 0) {
+            Write-Host "  build failed -> skipped" -ForegroundColor Red
+            if ($job -eq 'compress' -and $mode -eq 'git') { Write-Host "  tip: try 'full' mode for non-git folders." -ForegroundColor Yellow }
+            $summary += [pscustomobject]@{ Name = $name; Result = "build failed"; Ok = $false }
+            continue
+        }
+        if (-not $parts) {
+            if ($job -eq 'sync') {
+                Write-Host "  no changes" -ForegroundColor DarkGray
+                $summary += [pscustomobject]@{ Name = $name; Result = "sin cambios"; Ok = $true }
+            } else {
+                Write-Host "  produced nothing -> skipped" -ForegroundColor Red
+                $summary += [pscustomobject]@{ Name = $name; Result = "build failed"; Ok = $false }
+            }
             continue
         }
         Write-Host ("  produced " + $parts.Count + " part(s)") -ForegroundColor DarkGray
 
-        $allOk     = $true
-        $lastDest  = ""
+        $allOk    = $true
+        $lastDest = ""
         foreach ($part in $parts) {
             $archive = "/tmp/$part"
             if ($destination -eq 'upload') {
                 Write-Host ">> Uploading $part to Dropbox..." -ForegroundColor DarkCyan
-                $result = Invoke-WslScript -Script $dropboxUpload -WslArgs @($archive, "$DropboxDestDir/$part")
+                $result = Invoke-WslScript -Script $dropboxUpload -WslArgs @($archive, "$dropDir/$part")
                 $clean = ($result | Where-Object { $_ }) -join ""
                 if ($LASTEXITCODE -eq 0 -and $clean) {
                     Write-Host ("  OK -> " + $clean) -ForegroundColor Green
@@ -319,18 +382,10 @@ try {
                     $allOk = $false
                 }
             } else {
-                # Local: copy to Windows Downloads from INSIDE WSL (binary-safe cp to /mnt/c
-                # via wslpath); avoids PowerShell mangling binary data over \\wsl.localhost.
-                Write-Host ">> Saving $part to Downloads..." -ForegroundColor DarkCyan
-                $null = Invoke-WslScript -Script @'
-set -e
-ARCHIVE="$1"; WINDEST="$2"
-DEST=$(wslpath -u "$WINDEST" 2>/dev/null) || { echo "ERROR: cannot map Windows path: $WINDEST" >&2; exit 1; }
-mkdir -p "$DEST"
-cp "$ARCHIVE" "$DEST/"
-'@ -WslArgs @($archive, $winDownloads)
+                Write-Host ">> Saving $part to $localTarget ..." -ForegroundColor DarkCyan
+                $null = Invoke-WslScript -Script $localCopy -WslArgs @($archive, $localTarget)
                 if ($LASTEXITCODE -eq 0) {
-                    $lastDest = Join-Path $winDownloads $part
+                    $lastDest = Join-Path $localTarget $part
                     Write-Host ("  OK -> " + $lastDest) -ForegroundColor Green
                 } else {
                     Write-Host "  save failed: $part" -ForegroundColor Red
@@ -339,18 +394,17 @@ cp "$ARCHIVE" "$DEST/"
             }
         }
 
-        # cleanup the single archive and/or all chunk parts for this folder
         Invoke-WslScript -Script 'rm -f "$1" "$1".*' -WslArgs @($out) | Out-Null
 
-        if ($chunkMb -gt 0) {
-            $reassemble = if ($ext -eq 'zip') { "cat $folder.zip.* > $folder.zip" }
-                          else { "cat $folder.tar.gz.* | tar xzf -" }
+        if ($job -eq 'compress' -and $chunkMb -gt 0) {
+            $reassemble = if ($ext -eq 'zip') { "cat $name.zip.* > $name.zip" }
+                          else { "cat $name.tar.gz.* | tar xzf -" }
             Write-Host ("  reassemble (in WSL/Linux): " + $reassemble) -ForegroundColor DarkGray
-            $folderResult = if ($allOk) { "$($parts.Count) parts -> $folder.$ext.*" } else { "partial/failed" }
+            $res = if ($allOk) { "$($parts.Count) parts -> $name.$ext.*" } else { "partial/failed" }
         } else {
-            $folderResult = if ($allOk) { $lastDest } else { "failed" }
+            $res = if ($allOk) { $lastDest } else { "failed" }
         }
-        $summary += [pscustomobject]@{ Folder = $folder; Result = $folderResult; Ok = $allOk }
+        $summary += [pscustomobject]@{ Name = $name; Result = $res; Ok = $allOk }
     }
 } finally {
     if ($destination -eq 'upload') {
@@ -366,6 +420,17 @@ Write-Host ""
 Write-Host "================ DONE ================" -ForegroundColor Green
 foreach ($s in $summary) {
     $c = if ($s.Ok) { 'Green' } else { 'Red' }
-    Write-Host ("  {0,-34} {1}" -f $s.Folder, $s.Result) -ForegroundColor $c
+    Write-Host ("  {0,-34} {1}" -f $s.Name, $s.Result) -ForegroundColor $c
 }
 Write-Host "=====================================" -ForegroundColor Green
+if ($job -eq 'sync') {
+    if ($destination -eq 'local') {
+        Write-Host "Bundles in: $localTarget" -ForegroundColor Cyan
+        Write-Host "Move that folder to the laptop and run laptop-import.sh." -ForegroundColor Cyan
+        Write-Host "No trace in WSL (/tmp cleaned). Delete the Downloads copy after moving." -ForegroundColor DarkGray
+    } else {
+        Write-Host "Bundles uploaded to Dropbox: $dropDir" -ForegroundColor Cyan
+        Write-Host "Download that folder on the laptop and run laptop-import.sh." -ForegroundColor Cyan
+        Write-Host "No trace on the VDI: nothing kept locally, /tmp cleaned." -ForegroundColor DarkGray
+    }
+}
