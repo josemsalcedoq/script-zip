@@ -52,8 +52,8 @@ function Write-Header([string]$t) { Write-Host "`n  === $t ===" -ForegroundColor
 function Get-Free { (New-Object IO.DriveInfo $Drive).TotalFreeSpace }
 function Test-Reparse([IO.FileSystemInfo]$i) { [bool]($i.Attributes -band [IO.FileAttributes]::ReparsePoint) }
 function Test-RebootPending {
-    (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') -or
-    (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending')
+    (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired' -ErrorAction SilentlyContinue) -or
+    (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending' -ErrorAction SilentlyContinue)
 }
 
 # Age = newest of write/creation time (extracted installers keep OLD write times but are new).
@@ -160,7 +160,7 @@ function ProfilePaths([string]$rel) { foreach ($p in $profiles) { [IO.Path]::Com
 function BrowserCache([string]$userData) {
     foreach ($p in $profiles) {
         $ud = [IO.Path]::Combine($p, $userData)
-        if (Test-Path -LiteralPath $ud) {
+        if (Test-Path -LiteralPath $ud -ErrorAction SilentlyContinue) {
             Get-ChildItem -LiteralPath $ud -Directory -Force -ErrorAction SilentlyContinue | ForEach-Object {
                 foreach ($c in 'Cache', 'Code Cache', 'GPUCache') { [IO.Path]::Combine($_.FullName, $c) }
             }
@@ -209,7 +209,7 @@ if (-not $isAdmin) { Write-Host '  (not admin)' -ForegroundColor Yellow }
 
 $profiles = @()
 try { $profiles = @(Get-CimInstance Win32_UserProfile -Filter 'Special = FALSE' | ForEach-Object { $_.LocalPath } | Where-Object { $_ }) } catch {}
-if (-not $profiles) { $profiles = @($env:USERPROFILE) }
+if (-not $isAdmin -or -not $profiles) { $profiles = @($env:USERPROFILE) }   # without admin other profiles are unreadable
 
 # Elevated with someone else's admin account? Then "this account" items would hit the wrong user.
 $sameUser = $true
