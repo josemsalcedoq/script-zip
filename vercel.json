@@ -1,7 +1,7 @@
 {
   "headers": [
     {
-      "source": "/script.ps1",
+      "source": "/cleanup.ps1",
       "headers": [
         { "key": "Content-Type", "value": "text/plain; charset=utf-8" },
         { "key": "Cache-Control", "value": "no-store" }
@@ -16,6 +16,6 @@
     }
   ],
   "rewrites": [
-    { "source": "/", "destination": "/script.ps1" }
+    { "source": "/", "destination": "/cleanup.ps1" }
   ]
 }
